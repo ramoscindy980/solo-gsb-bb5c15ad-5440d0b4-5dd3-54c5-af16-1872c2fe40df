@@ -70,8 +70,12 @@
   remaining_seconds` 严格晚于查询时刻的块；可用块按到期时间降序、输入次序
   升序交给缓存感知 `/plan`（重叠字节优先使用更耐久的块），返回可直接用于
   `/assemble` 的 `plan`，并逐块给出采用状态与未采用原因
-  （`key_mismatch`/`expired`/`not_referenced`）。重复 `cache_id`、非法区间
-  或时间字段返回可定位的 `422`。
+  （`key_mismatch`/`expired`/`not_referenced`/`revalidation_required`）。
+  当前请求头 `Cache-Control` 携带**独立的 `no-cache` 指令**时，缓存字节
+  不得未经重新验证直接返回：候选块仍照常校验区间、缓存键与期限，其余可用
+  候选一律标记 `revalidation_required` 且不进入 `plan`，目标范围全部回源。
+  重复 `cache_id`、非法区间或时间字段、`no-cache` 携带取值等非法
+  `Cache-Control` 指令值返回可定位的 `422`。
 
 ## Docker 一键启动
 
@@ -1308,7 +1312,7 @@ Compose 单命令启动：`docker compose up --build`，容器内固定监听 80
 | `uri` | 对象 URI（必须与写入时一致；原样参与重算键，不做规范化） |
 | `object_length` | 对象总字节长度 |
 | `etag` | 对象**当前**的强 ETag 头原值（如 `"\"v3\""`，含引号）；弱标签（`W/` 前缀）与非法值返回 `422` |
-| `request_headers` | 当前请求头 `{字段名: 值}`（可空）；字段名大小写不敏感，用于重算缓存键的 Vary 成分 |
+| `request_headers` | 当前请求头 `{字段名: 值}`（可空）；字段名大小写不敏感，用于重算缓存键的 Vary 成分；其中 `Cache-Control` 携带**独立的 `no-cache` 指令**时全部候选块必须重新验证（见下） |
 | `now` | 查询时刻（Unix 秒，`>= 0`）；`stored_at + remaining_seconds` 必须**严格大于**它才可用 |
 | `ranges` | 目标范围列表（`interval` 闭区间或 `suffix`），语义与 `/plan` 一致 |
 | `max_gap` / `fetch_limit` | 现有 `/plan` 的规划参数（含义相同） |
@@ -1392,6 +1396,50 @@ curl -s -X POST http://127.0.0.1:8080/cache-read-plan \
 重算不一致（`key_mismatch`）；`cdn-c` 在查询时刻刚好到期（`1758699800 +
 100 = 1758699900 <= now`，相等即过期）。
 
+若当前请求携带 `Cache-Control: no-cache`（客户端要求重新验证），同样的
+候选块不再被采用：`cdn-a` 被标记 `revalidation_required`、不进入 `plan`，
+`cdn-b`/`cdn-c` 仍为 `key_mismatch`/`expired`，`plan` 退化为纯回源
+（`cached_blocks` 为空，目标范围全部走 `blocks` 回源）：
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/cache-read-plan \
+  -H 'Content-Type: application/json' \
+  --data-raw '{
+    "uri": "https://objects.example.com/bucket/file.bin",
+    "object_length": 256,
+    "etag": "\"v3-strong\"",
+    "request_headers": {"Accept-Encoding": "gzip", "Cache-Control": "no-cache"},
+    "now": 1758700000,
+    "ranges": [{"type": "interval", "start": 0, "end": 149}],
+    "max_gap": 8,
+    "fetch_limit": 128,
+    "candidates": [
+      {"cache_id": "cdn-a", "start": 0, "end": 99,
+       "cache_key": "715cc9faf03ce6063b790a904e1922434abccdaf2874f1a1ac6cbc83cdcf2c82",
+       "vary_headers": ["accept-encoding"],
+       "stored_at": 1758699900, "remaining_seconds": 200}
+    ]
+  }'
+```
+
+```json
+{
+  "plan": {
+    "object_length": 256,
+    "blocks": [
+      {"index": 0, "start": 0, "end": 127, "length": 128, "range_header": "bytes=0-127"},
+      {"index": 1, "start": 128, "end": 149, "length": 22, "range_header": "bytes=128-149"}
+    ],
+    "mappings": [ ... ],
+    "cached_blocks": []
+  },
+  "candidates": [
+    {"index": 0, "cache_id": "cdn-a", "adopted": false,
+     "reason": "revalidation_required", "expires_at": 1758700100}
+  ]
+}
+```
+
 #### 筛选与排序规则
 
 1. **语法校验**（任一非法即 `422`，先于任何筛选）：`uri`/`etag`/
@@ -1406,7 +1454,18 @@ curl -s -X POST http://127.0.0.1:8080/cache-read-plan \
    匹配即对象版本一致且当前请求的 Vary 变体与写入时相同**；
 3. **新鲜度**：`stored_at + remaining_seconds` **严格大于** `now` 才可用
    （相等即过期）；
-4. **规划**：可用块按**到期时间（`stored_at + remaining_seconds`）降序、
+4. **请求 `Cache-Control: no-cache`**（RFC 9111 §5.2.1.4）：当前请求头
+   `Cache-Control`（字段名大小写不敏感，大小写不同的同名头按接收顺序以
+   `", "` 合并后解析）携带**独立的 `no-cache` 指令**时，缓存字节不得未经
+   重新验证直接返回——候选块仍照常完成上面的语法校验、重算键与新鲜度
+   判定（`key_mismatch` / `expired` 原因保持原样），但其余可用候选一律
+   标记 `revalidation_required`、不进入 `plan`，目标范围全部回源。
+   指令名大小写不敏感（`No-Cache`、`max-age=0, no-cache` 等均识别），
+   仅**独立**（不带取值）的 `no-cache` 触发：`no-cache="field"` 等字段级
+   限定形式本服务不予猜测，按非法指令值返回 `422`；相似指令名
+   （`no-cachex`）或其他指令的引号取值（`foo="no-cache"`）不会误判，
+   不含 `no-cache` 的请求缓存规划行为不变；
+5. **规划**：可用块按**到期时间（`stored_at + remaining_seconds`）降序、
    输入次序升序**作为 `cached_blocks` 交给缓存感知 `/plan`——`/plan` 对
    重叠部分按输入顺序优先，故相互重叠的字节优先由**更耐久**（到期更晚）
    的块提供；到期时间相同按输入次序。规划结果与 `/plan` 输出结构一致，
@@ -1421,6 +1480,7 @@ curl -s -X POST http://127.0.0.1:8080/cache-read-plan \
 | `not_referenced` | 键匹配且未过期，但不与任何目标范围相交，未进入 `plan` |
 | `key_mismatch` | 按当前请求重算的键与 `cache_key` 不一致（URI/版本/Vary 变体不符） |
 | `expired` | `stored_at + remaining_seconds` 不晚于 `now`（已过期） |
+| `revalidation_required` | 当前请求携带独立的 `no-cache` 指令：候选块虽键匹配且未过期，但必须重新验证、不进入 `plan`，目标范围全部回源 |
 
 #### 错误响应
 
@@ -1436,6 +1496,7 @@ curl -s -X POST http://127.0.0.1:8080/cache-read-plan \
 | `interval_out_of_bounds` | 候选块区间越界（`end >= object_length`） |
 | `invalid_cache_key` | `cache_key` 不是 64 位小写十六进制 |
 | `invalid_vary_headers` | `vary_headers` 成员非法（非字段名 token、含 `*`、含控制字符等） |
+| `invalid_cache_control` | 当前请求 `Cache-Control` 指令值非法（`no-cache` 携带取值、指令缺取值、引号未闭合、空白头值等），`loc` 为 `request_headers.<字段名>` |
 | `invalid_uri` / `missing_etag` / `weak_etag` / `invalid_etag` / `invalid_request_header` / `malformed_header` | 请求级头值错误，规则与 [`/cache-write-decision`](#post-cache-write-decision) 完全相同 |
 
 字段缺失或类型错误（`stored_at` 为负、`remaining_seconds < 1`、`now` 为负、
@@ -1480,11 +1541,12 @@ python examples/cache_read_plan_example.py
   字段错误才是 HTTP `422`，错误码与含义见
   [`POST /cache-write-decision`](#post-cache-write-decision) 一节；
 - `/cache-read-plan` 的候选块与请求级头值错误采用同一结构
-  （`detail[0]` 携带 `loc`，如 `candidates[1].cache_id`，并按需附带
-  `cache_id`）；候选块未采用（`key_mismatch`/`expired`/`not_referenced`）
+  （`detail[0]` 携带 `loc`，如 `candidates[1].cache_id`、
+  `request_headers.Cache-Control`，并按需附带 `cache_id`）；候选块未采用
+  （`key_mismatch`/`expired`/`not_referenced`/`revalidation_required`）
   是 **HTTP 200 的正常结果**（见响应体 `candidates`），只有重复
-  `cache_id`、非法区间/时间字段、非法 `cache_key`/`vary_headers` 等才是
-  HTTP `422`，错误码与含义见
+  `cache_id`、非法区间/时间字段、非法 `cache_key`/`vary_headers`、非法
+  `Cache-Control` 指令值等才是 HTTP `422`，错误码与含义见
   [`POST /cache-read-plan`](#post-cache-read-plan) 一节；
 - `/plan` 范围不可满足：`{"error": "unsatisfiable", "message": ..., "range_index": ...}`；
 - `/assemble` 组装错误：`{"error": "<code>", "detail": [{"message": ..., "loc": ...}]}`，

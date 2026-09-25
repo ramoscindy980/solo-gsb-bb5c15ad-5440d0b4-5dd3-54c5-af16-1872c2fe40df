@@ -104,8 +104,13 @@ POST /cache-read-plan 是 /cache-write-decision 的读取侧：接收对象 URI�
 与 Vary 变体一致）且 stored_at + remaining_seconds 严格晚于查询时刻的
 块；可用块按到期时间降序、输入次序升序交给缓存感知 /plan（重叠字节
 优先使用更耐久的块），返回可直接用于 /assemble 的 plan，并逐块给出
-采用状态与未采用原因（key_mismatch / expired / not_referenced）。
-重复 cache_id、非法区间或时间字段返回可定位的 422。
+采用状态与未采用原因（key_mismatch / expired / not_referenced /
+revalidation_required）。当前请求头携带独立的 no-cache 指令
+（Cache-Control）时，缓存字节不得未经重新验证直接返回：候选块仍照常
+校验区间、缓存键与期限（key_mismatch / expired 原因保持原样），其余
+可用候选一律标记 revalidation_required 且不进入 plan，目标范围全部
+回源；no-cache 携带取值或其他非法 Cache-Control 指令值返回可定位的
+422。重复 cache_id、非法区间或时间字段返回可定位的 422。
 """
 
 from __future__ import annotations
@@ -4742,7 +4747,8 @@ class CacheReadPlanRequest(BaseModel):
     request_headers: dict[str, str] = Field(
         default_factory=dict,
         max_length=_CACHE_WRITE_HEADER_MAX_ITEMS,
-        description="当前请求头（字段名大小写不敏感）；用于重算缓存键的 Vary 成分",
+        description="当前请求头（字段名大小写不敏感）；用于重算缓存键的 Vary 成分，"
+        "其中 Cache-Control 携带独立 no-cache 指令时全部候选块必须重新验证",
     )
     now: Annotated[int, StrictInt] = Field(
         ..., ge=0, description="查询时刻（Unix 秒）；stored_at + remaining_seconds 必须严格大于它"
@@ -4756,7 +4762,8 @@ class CacheReadPlanRequest(BaseModel):
 
 
 CacheReadCandidateReason = Literal[
-    "adopted", "not_referenced", "key_mismatch", "expired"
+    "adopted", "not_referenced", "key_mismatch", "expired",
+    "revalidation_required",
 ]
 
 
@@ -4772,7 +4779,9 @@ class CacheReadCandidateStatus(BaseModel):
         ...,
         description="adopted=已采用；not_referenced=可用但未与任何目标范围相交；"
         "key_mismatch=按当前请求重算的键与 cache_key 不一致（URI/版本/Vary 变体不符）；"
-        "expired=stored_at + remaining_seconds 不晚于查询时刻",
+        "expired=stored_at + remaining_seconds 不晚于查询时刻；"
+        "revalidation_required=当前请求携带独立 no-cache 指令，候选块虽键匹配"
+        "且未过期，但必须重新验证、不进入 plan",
     )
     expires_at: int = Field(
         ..., description="到期时刻（stored_at + remaining_seconds，Unix 秒）"
@@ -4870,6 +4879,45 @@ def _normalize_candidate_vary_headers(raw: list[str], loc: str) -> list[str]:
     return sorted(fields)
 
 
+def _request_cache_revalidation_required(
+    raw_headers: dict[str, str], headers: dict[str, str]
+) -> bool:
+    """检查当前请求的 Cache-Control 是否携带独立的 no-cache 指令。
+
+    raw_headers 为请求原样携带的 {字段名: 值}，headers 为
+    _normalize_cache_write_headers 归一化后的结果（同名头已按接收顺序
+    以 ", " 合并）。沿用 /cache-write-decision 的 Cache-Control 指令
+    解析：指令名大小写不敏感，仅独立（不带取值）的 no-cache 触发重新
+    验证——no-cache="field" 等字段级限定形式本服务不予猜测，按非法
+    指令值返回可定位的 422；其他指令（含未知扩展指令）照常忽略。
+    """
+    if "cache-control" not in headers:
+        return False
+    # loc 沿用 request_headers.<字段名> 形式，取客户端实际携带的原名。
+    loc = "request_headers.cache-control"
+    for name in raw_headers:
+        if name.lower() == "cache-control":
+            loc = f"request_headers.{name}"
+            break
+    try:
+        directives = _parse_cache_control_directives(headers["cache-control"])
+    except CacheWriteError as exc:
+        raise CacheReadPlanError(exc.message, loc, code=exc.code) from exc
+    required = False
+    for name, value in directives:
+        if name != "no-cache":
+            continue
+        if value is not None:
+            raise CacheReadPlanError(
+                "Cache-Control 请求指令 no-cache 不接受取值：仅支持独立的 "
+                "no-cache（要求重新验证），字段级限定形式不予猜测",
+                loc,
+                code="invalid_cache_control",
+            )
+        required = True
+    return required
+
+
 @app.post("/cache-read-plan", response_model=CacheReadPlanResponse)
 def cache_read_plan(req: CacheReadPlanRequest) -> CacheReadPlanResponse:
     """筛选可用候选缓存块，并生成可直接用于 /assemble 的回源规划。
@@ -4879,9 +4927,13 @@ def cache_read_plan(req: CacheReadPlanRequest) -> CacheReadPlanResponse:
     2. 仅保留重算键与 cache_key 全等（键材料含 ETag 与 Vary 取值，故键
        匹配即版本与 Vary 变体一致）且 stored_at + remaining_seconds 严格
        大于 now 的候选块；
-    3. 可用块按到期时间降序、输入次序升序作为 cached_blocks 交给缓存感知
+    3. 当前请求 Cache-Control 携带独立 no-cache 指令时，缓存字节必须
+       重新验证：候选块仍照常校验区间、缓存键与期限（key_mismatch /
+       expired 原因保持原样），其余可用候选一律标记
+       revalidation_required 且不进入 plan，目标范围全部回源；
+    4. 可用块按到期时间降序、输入次序升序作为 cached_blocks 交给缓存感知
        规划（相互重叠的字节优先由更耐久的块提供）；
-    4. 返回 plan 与逐块采用状态/未采用原因。
+    5. 返回 plan 与逐块采用状态/未采用原因。
     """
     # 1. 请求级要素：与写入侧完全相同的校验与规范化（错误码/loc 一致），
     #    保证重算键与写入键逐字节可比。
@@ -4891,6 +4943,12 @@ def cache_read_plan(req: CacheReadPlanRequest) -> CacheReadPlanResponse:
         headers = _normalize_cache_write_headers(req.request_headers)
     except CacheWriteError as exc:
         raise CacheReadPlanError(exc.message, exc.loc, code=exc.code) from exc
+
+    # 1b. 当前请求的 Cache-Control：独立 no-cache 指令要求重新验证
+    #     （RFC 9111 §5.2.1.4）——缓存字节不得未经源站验证直接返回。
+    revalidation_required = _request_cache_revalidation_required(
+        req.request_headers, headers
+    )
 
     # 2. 逐块校验（区间、cache_key 格式、vary_headers、id 唯一）并筛选可用块。
     seen_ids: set[object] = set()
@@ -4958,7 +5016,21 @@ def cache_read_plan(req: CacheReadPlanRequest) -> CacheReadPlanResponse:
             continue
         usable.append((expires_at, pos, cand))
 
-    # 3. 可用块按到期时间降序、输入次序升序交给缓存感知规划：/plan 对重叠
+    # 3. 要求重新验证时，可用候选一律不进入 plan：逐块标记
+    #    revalidation_required，目标范围全部回源；key_mismatch / expired
+    #    的候选状态已在上面给出，保持原样。
+    if revalidation_required:
+        for expires_at, pos, cand in usable:
+            statuses[pos] = CacheReadCandidateStatus(
+                index=pos,
+                cache_id=cand.cache_id,
+                adopted=False,
+                reason="revalidation_required",
+                expires_at=expires_at,
+            )
+        usable = []
+
+    # 4. 可用块按到期时间降序、输入次序升序交给缓存感知规划：/plan 对重叠
     #    部分按输入顺序优先，故重叠字节优先使用更耐久的块。与
     #    /client-range-decision 一样统一走缓存感知路径，单个范围允许超过
     #    fetch_limit（会被拆到多个回源块）。
