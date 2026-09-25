@@ -11,6 +11,11 @@
 - 排序：可用块按到期时间降序、输入次序升序交给 /plan，重叠字节优先使用
   更耐久的块；到期时间相同按输入次序；
 - 未采用原因：key_mismatch / expired / not_referenced 逐块给出；
+- 请求 Cache-Control：独立的 no-cache 指令（大小写不敏感、可与其他指令
+  混排、同名头合并解析）要求重新验证——键匹配且未过期的候选标记
+  revalidation_required 且不进入 plan，目标范围全部回源；key_mismatch /
+  expired 原因保持原样；no-cache 携带取值或 Cache-Control 语法非法返回
+  可定位的 422；其他指令（含未知扩展）与空白头不影响缓存规划；
 - 端到端：返回的 plan 直接提交 /assemble 重组出正确字节；
 - 422：重复 cache_id、非法区间（end < start、越界）、非法 cache_key、
   非法 vary_headers、非法时间字段（stored_at/remaining_seconds/now）、
@@ -529,6 +534,171 @@ class CacheReadPlanTests(unittest.TestCase):
         )
         self.assertEqual(resp.status_code, 422, resp.text)
         self.assertEqual(resp.json()["error"], "unsatisfiable")
+
+    # --------------------- 请求 Cache-Control: no-cache ---------------------
+
+    def test_no_cache_marks_revalidation_required(self) -> None:
+        # 当前请求携带独立的 no-cache：键匹配且未过期的候选块不得采用，
+        # 标记 revalidation_required，plan 退化为纯回源。
+        body = self.req(
+            request_headers={"Cache-Control": "no-cache"},
+            candidates=[self.cand("cdn-a", 0, 99)],
+        )
+        d = self.ok(self.post(body))
+        st = self.status_of(d, 0)
+        self.assertFalse(st["adopted"])
+        self.assertEqual(st["reason"], "revalidation_required")
+        self.assertEqual(st["expires_at"], NOW - 100 + 200)
+        self.assertEqual(d["plan"]["cached_blocks"], [])
+        # 目标范围 [0,149] 全部回源，按 fetch_limit 拆块。
+        self.assertEqual(
+            [(b["start"], b["end"]) for b in d["plan"]["blocks"]],
+            [(0, 127), (128, 149)],
+        )
+        for m in d["plan"]["mappings"]:
+            for sl in m["slices"]:
+                self.assertEqual(sl["source"], "fetch")
+
+    def test_no_cache_keeps_mismatch_and_expired_reasons(self) -> None:
+        # no-cache 下仍照常校验缓存键与期限：key_mismatch / expired 原因不变。
+        cands = [
+            self.cand("cdn-a", 0, 99, stored_at=NOW - 300, remaining_seconds=100),
+            self.cand("cdn-b", 100, 149, key_over={"etag": '"v2-old"'}),
+            self.cand("cdn-c", 0, 149),
+        ]
+        d = self.ok(
+            self.post(
+                self.req(
+                    request_headers={"Cache-Control": "no-cache"},
+                    candidates=cands,
+                )
+            )
+        )
+        self.assertEqual(self.status_of(d, 0)["reason"], "expired")
+        self.assertEqual(self.status_of(d, 1)["reason"], "key_mismatch")
+        self.assertEqual(self.status_of(d, 2)["reason"], "revalidation_required")
+        self.assertEqual(d["plan"]["cached_blocks"], [])
+
+    def test_no_cache_directive_name_case_insensitive(self) -> None:
+        for value in ("no-cache", "No-Cache", "NO-CACHE", "max-age=0, No-Cache"):
+            with self.subTest(value=value):
+                d = self.ok(
+                    self.post(
+                        self.req(
+                            request_headers={"Cache-Control": value},
+                            candidates=[self.cand("cdn-a", 0, 99)],
+                        )
+                    )
+                )
+                self.assertEqual(
+                    self.status_of(d, 0)["reason"], "revalidation_required"
+                )
+
+    def test_no_cache_header_name_case_insensitive_and_merged(self) -> None:
+        # 字段名大小写不敏感；同名头按 ", " 合并后统一解析。
+        d = self.ok(
+            self.post(
+                self.req(
+                    request_headers={
+                        "Cache-Control": "max-age=0",
+                        "cache-control": "no-cache",
+                    },
+                    candidates=[self.cand("cdn-a", 0, 99)],
+                )
+            )
+        )
+        self.assertEqual(self.status_of(d, 0)["reason"], "revalidation_required")
+
+    def test_no_cache_with_value_422(self) -> None:
+        # no-cache 携带取值属于非法指令值：可定位的 422。
+        for value in ('no-cache="Set-Cookie"', "no-cache=x", "no-cache=", 'no-cache=""'):
+            with self.subTest(value=value):
+                self.err(
+                    self.post(
+                        self.req(
+                            request_headers={"Cache-Control": value},
+                            candidates=[self.cand("cdn-a", 0, 99)],
+                        )
+                    ),
+                    "invalid_cache_control",
+                    "request_headers.Cache-Control",
+                )
+
+    def test_malformed_cache_control_422(self) -> None:
+        self.err(
+            self.post(
+                self.req(request_headers={"Cache-Control": 'no-cache, "unclosed'})
+            ),
+            "invalid_cache_control",
+            "request_headers.Cache-Control",
+        )
+
+    def test_other_cache_control_directives_ignored(self) -> None:
+        # 非 no-cache 指令（含未知扩展与近似拼写）不影响缓存规划。
+        for value in ("max-age=0", "no-store", "no-cachex", "x-no-cache", "only-if-cached"):
+            with self.subTest(value=value):
+                d = self.ok(
+                    self.post(
+                        self.req(
+                            request_headers={"Cache-Control": value},
+                            candidates=[self.cand("cdn-a", 0, 99)],
+                        )
+                    )
+                )
+                self.assertTrue(self.status_of(d, 0)["adopted"], value)
+
+    def test_blank_cache_control_treated_as_absent(self) -> None:
+        d = self.ok(
+            self.post(
+                self.req(
+                    request_headers={"Cache-Control": "   "},
+                    candidates=[self.cand("cdn-a", 0, 99)],
+                )
+            )
+        )
+        self.assertTrue(self.status_of(d, 0)["adopted"])
+
+    def test_no_cache_without_candidates_pure_fetch(self) -> None:
+        d = self.ok(
+            self.post(self.req(request_headers={"Cache-Control": "no-cache"}))
+        )
+        self.assertEqual(d["candidates"], [])
+        self.assertEqual(d["plan"]["cached_blocks"], [])
+        self.assertEqual(
+            [(b["start"], b["end"]) for b in d["plan"]["blocks"]],
+            [(0, 127), (128, 149)],
+        )
+
+    def test_no_cache_plan_usable_for_assemble(self) -> None:
+        # no-cache 下返回的 plan 全部回源，可直接提交 /assemble。
+        body = self.req(
+            request_headers={"Cache-Control": "no-cache"},
+            candidates=[self.cand("cdn-a", 0, 99)],
+        )
+        d = self.ok(self.post(body))
+        plan = d["plan"]
+        contents = [
+            {
+                "block_index": b["index"],
+                "data_b64": base64.b64encode(OBJ[b["start"] : b["end"] + 1]).decode(),
+            }
+            for b in plan["blocks"]
+        ]
+        resp = self.client.post(
+            "/assemble",
+            json={
+                "object_length": 256,
+                "blocks": plan["blocks"],
+                "mappings": plan["mappings"],
+                "contents": contents,
+                "cached_blocks": plan["cached_blocks"],
+                "cache_contents": [],
+            },
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        assembled = resp.json()["ranges"][0]
+        self.assertEqual(assembled["length"], 150)
+        self.assertEqual(base64.b64decode(assembled["data_b64"]), OBJ[0:150])
 
     # --------------------- 与 /cache-write-decision 联动 ---------------------
 

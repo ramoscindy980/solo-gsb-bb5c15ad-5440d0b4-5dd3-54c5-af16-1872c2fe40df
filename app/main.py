@@ -105,6 +105,11 @@ POST /cache-read-plan 是 /cache-write-decision 的读取侧：接收对象 URI�
 块；可用块按到期时间降序、输入次序升序交给缓存感知 /plan（重叠字节
 优先使用更耐久的块），返回可直接用于 /assemble 的 plan，并逐块给出
 采用状态与未采用原因（key_mismatch / expired / not_referenced）。
+当前请求头携带独立的 Cache-Control: no-cache 指令时（RFC 9111
+§5.2.1.4），缓存字节必须经源站重新验证后才能使用：候选块仍照常校验
+区间、缓存键与期限（key_mismatch / expired 原因不变），其余键匹配且
+未过期的候选一律标记 revalidation_required 且不进入 plan，目标范围
+全部回源；no-cache 携带取值等非法指令值返回可定位的 422。
 重复 cache_id、非法区间或时间字段返回可定位的 422。
 """
 
@@ -4756,7 +4761,7 @@ class CacheReadPlanRequest(BaseModel):
 
 
 CacheReadCandidateReason = Literal[
-    "adopted", "not_referenced", "key_mismatch", "expired"
+    "adopted", "not_referenced", "key_mismatch", "expired", "revalidation_required"
 ]
 
 
@@ -4772,7 +4777,9 @@ class CacheReadCandidateStatus(BaseModel):
         ...,
         description="adopted=已采用；not_referenced=可用但未与任何目标范围相交；"
         "key_mismatch=按当前请求重算的键与 cache_key 不一致（URI/版本/Vary 变体不符）；"
-        "expired=stored_at + remaining_seconds 不晚于查询时刻",
+        "expired=stored_at + remaining_seconds 不晚于查询时刻；"
+        "revalidation_required=键匹配且未过期，但当前请求携带独立的 "
+        "Cache-Control: no-cache 指令，缓存字节必须经源站重新验证，未进入 plan",
     )
     expires_at: int = Field(
         ..., description="到期时刻（stored_at + remaining_seconds，Unix 秒）"
@@ -4870,6 +4877,40 @@ def _normalize_candidate_vary_headers(raw: list[str], loc: str) -> list[str]:
     return sorted(fields)
 
 
+def _request_requires_revalidation(headers: dict[str, str]) -> bool:
+    """当前请求的 Cache-Control 是否携带独立的 no-cache 指令。
+
+    复用写入侧的 Cache-Control 指令解析（指令名大小写不敏感、引号内的
+    逗号不分隔、空成员忽略、quoted-pair 转义还原）；头缺席或为空白时按
+    未携带处理（与普通请求行为一致）。独立的 no-cache（不带取值）按
+    RFC 9111 §5.2.1.4 要求：缓存不得直接使用已存字节，必须经源站重新
+    验证。no-cache 携带取值属于非法指令值，与解析语法错误一样抛出可
+    定位的 422（loc 指向 request_headers.Cache-Control）；其他指令
+    （含未知扩展）不影响缓存读取规划，照常忽略。
+    """
+    raw = headers.get("cache-control")
+    if raw is None or not raw.strip(_OWS_STRIP):
+        return False
+    loc = "request_headers.Cache-Control"
+    try:
+        directives = _parse_cache_control_directives(raw)
+    except CacheWriteError as exc:
+        raise CacheReadPlanError(exc.message, loc, code=exc.code) from exc
+    required = False
+    for name, value in directives:
+        if name != "no-cache":
+            continue
+        if value is not None:
+            raise CacheReadPlanError(
+                "请求 Cache-Control 的 no-cache 指令不接受取值："
+                "独立使用即要求缓存字节经源站重新验证后才能使用",
+                loc,
+                code="invalid_cache_control",
+            )
+        required = True
+    return required
+
+
 @app.post("/cache-read-plan", response_model=CacheReadPlanResponse)
 def cache_read_plan(req: CacheReadPlanRequest) -> CacheReadPlanResponse:
     """筛选可用候选缓存块，并生成可直接用于 /assemble 的回源规划。
@@ -4878,7 +4919,9 @@ def cache_read_plan(req: CacheReadPlanRequest) -> CacheReadPlanResponse:
        规范化与键算法，结合候选块的区间与 vary_headers 逐块重算缓存键；
     2. 仅保留重算键与 cache_key 全等（键材料含 ETag 与 Vary 取值，故键
        匹配即版本与 Vary 变体一致）且 stored_at + remaining_seconds 严格
-       大于 now 的候选块；
+       大于 now 的候选块；当前请求携带独立的 Cache-Control: no-cache
+       指令时，这些可用候选只标记 revalidation_required，不进入 plan
+       （目标范围全部回源，等待源站重新验证）；
     3. 可用块按到期时间降序、输入次序升序作为 cached_blocks 交给缓存感知
        规划（相互重叠的字节优先由更耐久的块提供）；
     4. 返回 plan 与逐块采用状态/未采用原因。
@@ -4891,6 +4934,12 @@ def cache_read_plan(req: CacheReadPlanRequest) -> CacheReadPlanResponse:
         headers = _normalize_cache_write_headers(req.request_headers)
     except CacheWriteError as exc:
         raise CacheReadPlanError(exc.message, exc.loc, code=exc.code) from exc
+
+    # 1b. 当前请求携带独立的 Cache-Control: no-cache 指令时，任何缓存字节
+    #     都必须经源站重新验证后才能使用：候选块仍照常做第 2 步的区间/
+    #     缓存键/期限校验（key_mismatch / expired 原因不变），但其余可用
+    #     候选只标记 revalidation_required，不进入 plan，目标范围全部回源。
+    revalidation_required = _request_requires_revalidation(headers)
 
     # 2. 逐块校验（区间、cache_key 格式、vary_headers、id 唯一）并筛选可用块。
     seen_ids: set[object] = set()
@@ -4953,6 +5002,16 @@ def cache_read_plan(req: CacheReadPlanRequest) -> CacheReadPlanResponse:
                 cache_id=cand.cache_id,
                 adopted=False,
                 reason="expired",
+                expires_at=expires_at,
+            )
+            continue
+        if revalidation_required:
+            # 键匹配且未过期，但当前请求要求重新验证：不采用、不进入 plan。
+            statuses[pos] = CacheReadCandidateStatus(
+                index=pos,
+                cache_id=cand.cache_id,
+                adopted=False,
+                reason="revalidation_required",
                 expires_at=expires_at,
             )
             continue
